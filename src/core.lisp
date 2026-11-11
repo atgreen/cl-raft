@@ -113,7 +113,8 @@
   snapshot-fn                           ; (lambda () -> opaque state-machine snapshot)
   restore-fn                            ; (lambda (snapshot)) restores the state machine
   (timeout-fn (lambda () 10))           ; -> next election timeout (randomized in prod)
-  ;; leader: commit-index -> list of (client-callback . nil); resolved on apply
+  ;; leader: log index -> (term . client-callback), resolved on apply only when
+  ;; the committed entry at that index still carries the proposing term.
   (pending (make-hash-table :test 'eql)))
 
 ;;; ---------------------------------------------------------------------------
@@ -267,6 +268,11 @@ is a borrowed sequence; retain only entries after INDEX. Caller holds the node l
                  (incf count))) entries)
     (loop for i from count below end do (setf (aref log i) nil))
     (setf (fill-pointer log) count))
+  ;; Entries covered by an installed snapshot are never applied here, so their
+  ;; results are unknowable locally; release any callbacks waiting on them.
+  (loop for pending-index being the hash-keys of (raft-node-pending node)
+        when (<= pending-index index) collect pending-index into stale
+        finally (dolist (i stale) (remhash i (raft-node-pending node))))
   (setf (raft-node-snapshot-index node) index (raft-node-snapshot-term node) term
         (raft-node-snapshot-state node) state (raft-node-last-applied node) index
         (raft-node-commit-index node) index))
@@ -635,13 +641,17 @@ alone so existing persisted commands remain deliverable."
                                :configured)
                         (if (equal command '(:raft-barrier)) :barrier
                             (and (raft-node-apply-fn node) (funcall (raft-node-apply-fn node) command)))))
-                  (callback (gethash index (raft-node-pending node))))
+                  (pending (gethash index (raft-node-pending node))))
              ;; A failed application must be retried at this exact log position.
              ;; Callback failures, in contrast, must never apply the command twice.
              (setf (raft-node-last-applied node) index)
-             (when callback
+             (when pending
                (remhash index (raft-node-pending node))
-               (funcall callback result)))))
+               ;; A deposed leader's uncommitted entry may have been replaced by a
+               ;; different entry at the same index. That entry's result belongs to
+               ;; another client, so the stale callback is dropped, never resolved.
+               (when (= (car pending) (raft-entry-term entry))
+                 (funcall (cdr pending) result))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Client proposal (leader only).
@@ -680,7 +690,9 @@ alone so existing persisted commands remain deliverable."
   (if (and (eq (raft-node-role node) :leader) (not (raft-node-snapshot-pending node)))
       (let ((entry (raft-log-append node (make-raft-entry :term (raft-node-current-term node)
                                                           :command command))))
-        (when callback (setf (gethash (raft-entry-index entry) (raft-node-pending node)) callback))
+        (when callback
+          (setf (gethash (raft-entry-index entry) (raft-node-pending node))
+                (cons (raft-entry-term entry) callback)))
         (setf (gethash (raft-node-id node) (raft-node-match-index node)) (raft-entry-index entry))
         (raft-broadcast-append node)
         (raft-advance-commit node)

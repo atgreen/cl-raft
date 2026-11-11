@@ -131,7 +131,57 @@
     (dolist (id '("a" "b" "c"))
       (is (equal "v2" (gethash "k" (rsim-kv sim id))) "node ~A converged to k=v2" id))
     (let ((terms (loop for (id . n) in (rsim-nodes sim) collect (cl-raft:raft-node-current-term n))))
-      (is (apply #'= terms) "all members on one term after heal"))))
+      (is (apply #'= terms) "all members on one term after heal"))
+    (is (null minority-cb) "discarded proposal's callback never resolves")))
+
+(test raft-deposed-leader-callback-not-resolved-by-replacement-entry
+  ;; A deposed leader's uncommitted entry is overwritten at the SAME index by the
+  ;; new leader's entry. Applying that replacement must not hand its result to
+  ;; the client that proposed the discarded entry.
+  (let ((sim (three-node-sim)) (stale-cb :never-called) (fresh-cb :never-called))
+    (rsim-run sim 8)
+    (cl-raft:raft-propose (rsim-node sim "a") '(:set "k" "v1"))
+    (rsim-run sim 6)
+    (setf (rsim-groups sim) '(("a") ("b" "c")))
+    (let ((stale-index (cl-raft:raft-propose (rsim-node sim "a") '(:set "k" "vX")
+                                             (lambda (r) (setf stale-cb r)))))
+      (rsim-run sim 10)
+      (let* ((leader (first (remove "a" (rsim-leaders sim) :test #'equal)))
+             (fresh-index (cl-raft:raft-propose (rsim-node sim leader) '(:set "k" "v2")
+                                                (lambda (r) (setf fresh-cb r)))))
+        (is (= stale-index fresh-index) "replacement entry occupies the stale index")))
+    (rsim-run sim 8)
+    (setf (rsim-groups sim) nil)
+    (rsim-run sim 12)
+    (is (equal "v2" (gethash "k" (rsim-kv sim "a"))) "old leader applied the replacement")
+    (is (equal "v2" fresh-cb) "new leader's client receives its own result")
+    (is (eq :never-called stale-cb) "discarded proposal's callback is not resolved")))
+
+(test raft-deposed-leader-callback-resolves-if-its-entry-survives
+  ;; Leadership loss alone must not drop a callback: if the deposed leader's
+  ;; entry reached a majority, the next leader commits it, and the original
+  ;; client still learns its result.
+  (let ((sim (three-node-sim)) (cb :never-called))
+    (rsim-run sim 8)
+    (cl-raft:raft-propose (rsim-node sim "a") '(:set "k" "kept") (lambda (r) (setf cb r)))
+    ;; Deliver the append to b and c but drop their replies, so a never learns
+    ;; the entry reached a majority; then cut a off.
+    (loop while (rsim-queue sim)
+          do (destructuring-bind (to . msg) (pop (rsim-queue sim))
+               (unless (equal to "a")
+                 (cl-raft:raft-handle-message (rsim-node sim to) msg))))
+    (is (eq :never-called cb) "old leader has not observed the commit")
+    (setf (rsim-groups sim) '(("a") ("b" "c")))
+    (rsim-run sim 12)
+    ;; A new leader commits prior-term entries only via an entry of its own term
+    ;; (Raft §5.4.2), so it proposes a barrier.
+    (let ((leader (first (remove "a" (rsim-leaders sim) :test #'equal))))
+      (cl-raft:raft-propose (rsim-node sim leader) '(:raft-barrier)))
+    (rsim-run sim 4)
+    (setf (rsim-groups sim) nil)
+    (rsim-run sim 12)
+    (dolist (id '("a" "b" "c")) (is (equal "kept" (gethash "k" (rsim-kv sim id)))))
+    (is (equal "kept" cb) "callback resolves when the entry itself commits")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Durability + compaction (podster-c2d.2).
