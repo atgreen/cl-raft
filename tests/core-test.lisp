@@ -86,7 +86,8 @@
     (rsim-run sim 6)
     (dolist (id '("a" "b" "c"))
       (is (= 2 (gethash "x" (rsim-kv sim id))) "node ~A has x=2" id)
-      (is (= 2 (cl-raft:raft-node-commit-index (rsim-node sim id)))))))
+      ;; Index 1 is the leader's election barrier, then the two writes.
+      (is (= 3 (cl-raft:raft-node-commit-index (rsim-node sim id)))))))
 
 (test raft-linearizable-compare-and-swap
   (let ((sim (three-node-sim)) (r1 nil) (r2 nil))
@@ -143,16 +144,20 @@
     (cl-raft:raft-propose (rsim-node sim "a") '(:set "k" "v1"))
     (rsim-run sim 6)
     (setf (rsim-groups sim) '(("a") ("b" "c")))
-    (let ((stale-index (cl-raft:raft-propose (rsim-node sim "a") '(:set "k" "vX")
+    (let ((stale-term (cl-raft:raft-node-current-term (rsim-node sim "a")))
+          (stale-index (cl-raft:raft-propose (rsim-node sim "a") '(:set "k" "vX")
                                              (lambda (r) (setf stale-cb r)))))
       (rsim-run sim 10)
-      (let* ((leader (first (remove "a" (rsim-leaders sim) :test #'equal)))
-             (fresh-index (cl-raft:raft-propose (rsim-node sim leader) '(:set "k" "v2")
-                                                (lambda (r) (setf fresh-cb r)))))
-        (is (= stale-index fresh-index) "replacement entry occupies the stale index")))
-    (rsim-run sim 8)
-    (setf (rsim-groups sim) nil)
-    (rsim-run sim 12)
+      (let ((leader (first (remove "a" (rsim-leaders sim) :test #'equal))))
+        (cl-raft:raft-propose (rsim-node sim leader) '(:set "k" "v2")
+                              (lambda (r) (setf fresh-cb r))))
+      (rsim-run sim 8)
+      (setf (rsim-groups sim) nil)
+      (rsim-run sim 12)
+      ;; A later-term entry (the new leader's election barrier) now occupies it.
+      (is (< stale-term (cl-raft:raft-entry-term
+                         (cl-raft:raft-log-entry (rsim-node sim "a") stale-index)))
+          "a later-term entry replaced the stale proposal"))
     (is (equal "v2" (gethash "k" (rsim-kv sim "a"))) "old leader applied the replacement")
     (is (equal "v2" fresh-cb) "new leader's client receives its own result")
     (is (eq :never-called stale-cb) "discarded proposal's callback is not resolved")))
@@ -173,11 +178,8 @@
     (is (eq :never-called cb) "old leader has not observed the commit")
     (setf (rsim-groups sim) '(("a") ("b" "c")))
     (rsim-run sim 12)
-    ;; A new leader commits prior-term entries only via an entry of its own term
-    ;; (Raft §5.4.2), so it proposes a barrier.
-    (let ((leader (first (remove "a" (rsim-leaders sim) :test #'equal))))
-      (cl-raft:raft-propose (rsim-node sim leader) '(:raft-barrier)))
-    (rsim-run sim 4)
+    ;; No client writes on the new leader: its election barrier alone must commit
+    ;; the inherited entry (Raft §5.4.2).
     (setf (rsim-groups sim) nil)
     (rsim-run sim 12)
     (dolist (id '("a" "b" "c")) (is (equal "kept" (gethash "k" (rsim-kv sim id)))))

@@ -17,7 +17,8 @@
   :components ((:module "tests" :serial t
                 :components ((:file "package") (:file "core-test")
                              (:file "persistence-test")
-                             (:file "wal-hardening-test"))))
+                             (:file "wal-hardening-test")
+                             (:file "availability-test"))))
   :perform (test-op (operation component)
              (declare (ignore operation component))
              (unless (uiop:symbol-call :fiveam :run!
