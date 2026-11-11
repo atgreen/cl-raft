@@ -1,7 +1,22 @@
-
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# build artifacts
+*.fasl
+*.dx64fsl
+.cache/
+
+# ocicl-managed dependencies (not part of the library)
+/ocicl.csv
+/ocicl/
+
+# agent/developer tooling, not part of the library
+/.agents/
+/.beads/
+/.claude/
+/.codex/
+/.cursor/
