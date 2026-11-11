@@ -1201,11 +1201,29 @@ Protocol-only traffic remains available to establish a recovery commit."
                                               :success t :match-index last-new
                                               :applied-index (min last-new (raft-node-last-applied node))))))))))))
 
+(defun raft-peer-recovery-index (node peer)
+  "Read PEER's anchored recovery index, tolerating a legacy boolean marker."
+  (let ((required (gethash peer (raft-node-peer-snapshot-required node))))
+    (when required
+      (if (integerp required) required
+          (gethash peer (raft-node-next-index node) (raft-node-snapshot-index node))))))
+
+(defun raft-note-peer-recovery-progress (node peer index)
+  "Clear PEER's snapshot preference once INDEX reaches its anchored recovery
+index.  Using the pre-reply anchor means a stale or lower acknowledgement cannot
+free a prefix the leader has already moved past."
+  (let ((required (raft-peer-recovery-index node peer)))
+    (when (and required (>= index required))
+      (remhash peer (raft-node-peer-snapshot-required node)))))
+
 (defun raft-handle-append-entries-reply (node msg)
   "Handle an AppendEntries reply as leader: on success record the peer's
    match/next-index and advance the commit index (applying anything newly
    committed); on failure back the peer's next-index up by one for the next
-   round. Steps down first if MSG's term is newer."
+   round. Steps down first if MSG's term is newer.  A reply from a non-member,
+   or a success whose match-index is not an integer in 0..last-log-index, is
+   ignored, and an accepted match-index never regresses -- so a stale, reordered
+   or malformed reply can neither crash the leader nor revoke proven progress."
   (raft-step-down-if-stale node (getf msg :term))
   (when (and (eq (raft-node-role node) :leader)
              (= (getf msg :term) (raft-node-current-term node)))
@@ -1215,42 +1233,53 @@ Protocol-only traffic remains available to establish a recovery commit."
       (let ((seq (getf msg :read-seq)))
         (when (and (typep seq 'fixnum) (> seq (gethash peer (raft-node-read-acks node) 0)))
           (setf (gethash peer (raft-node-read-acks node)) seq)))
-      (if (getf msg :success)
-          (progn
-            (setf (gethash peer (raft-node-match-index node)) (getf msg :match-index)
-                  (gethash peer (raft-node-next-index node)) (1+ (getf msg :match-index)))
-            (when (>= (getf msg :match-index) (raft-node-snapshot-index node))
-              (remhash peer (raft-node-peer-snapshot-required node)))
-            (let ((applied (getf msg :applied-index))
-                  (matched (getf msg :match-index)))
-              (when (and (member peer (raft-replicate-ids node) :test #'equal)
-                         (typep applied '(integer 0 #.most-positive-fixnum))
-                         (typep matched '(integer 0 #.most-positive-fixnum))
-                         (<= applied matched (raft-last-log-index node)))
-                (let ((prior (gethash peer (raft-node-peer-applied node))))
-                  (setf (gethash peer (raft-node-peer-applied node))
-                        (cons (raft-node-current-term node)
-                              (max applied (if (and prior (= (car prior) (raft-node-current-term node)))
-                                               (cdr prior) 0)))))))
-            (raft-advance-commit node)
-            (raft-apply-committed node)
-            (when (eq (raft-node-role node) :leader) (raft-maybe-send-timeout-now node)))
-          ;; Back up and retry on the next replication round.
-          (progn
-            (setf (gethash peer (raft-node-next-index node))
-                  (min (1+ (raft-last-log-index node))
-                       (max (1+ (gethash peer (raft-node-match-index node) 0))
-                            (or (getf msg :next-index)
-                                (1- (gethash peer (raft-node-next-index node) 1))))))
-            ;; Only a newer durable checkpoint can free the receiver's prefix.
-            ;; Keep this preference across ordinary heartbeat retries; the next
-            ;; successful snapshot/catch-up or membership/leadership reset clears it.
-            (when (and (getf msg :capacity-limited)
-                       (member peer (raft-replicate-ids node) :test #'equal)
-                       (<= (gethash peer (raft-node-next-index node))
-                           (raft-node-snapshot-index node)))
-              (setf (gethash peer (raft-node-peer-snapshot-required node)) t))))
-      (when (raft-node-pending-reads node) (raft-process-reads node)))))
+      (when (member peer (raft-replicate-ids node) :test #'equal)
+        (if (getf msg :success)
+            (when (and (typep (getf msg :match-index) '(integer 0 #.most-positive-fixnum))
+                       (<= (getf msg :match-index) (raft-last-log-index node)))
+              (raft-note-peer-recovery-progress node peer (getf msg :match-index))
+              ;; A successful acknowledgement cannot revoke already proven
+              ;; progress, so match/next never move backward.
+              (setf (gethash peer (raft-node-match-index node))
+                    (max (gethash peer (raft-node-match-index node) 0)
+                         (getf msg :match-index))
+                    (gethash peer (raft-node-next-index node))
+                    (max (gethash peer (raft-node-next-index node) 1)
+                         (1+ (gethash peer (raft-node-match-index node)))))
+              (let ((applied (getf msg :applied-index))
+                    (matched (getf msg :match-index)))
+                (when (and (typep applied '(integer 0 #.most-positive-fixnum))
+                           (typep matched '(integer 0 #.most-positive-fixnum))
+                           (<= applied matched (raft-last-log-index node)))
+                  (let ((prior (gethash peer (raft-node-peer-applied node))))
+                    (setf (gethash peer (raft-node-peer-applied node))
+                          (cons (raft-node-current-term node)
+                                (max applied (if (and prior (= (car prior) (raft-node-current-term node)))
+                                                 (cdr prior)
+                                                 0)))))))
+              (raft-advance-commit node)
+              (raft-apply-committed node)
+              (when (eq (raft-node-role node) :leader)
+                (raft-maybe-send-timeout-now node)))
+            ;; Back up and retry on the next replication round.
+            (let ((required (raft-peer-recovery-index node peer)))
+              (setf (gethash peer (raft-node-next-index node))
+                    (min (1+ (raft-last-log-index node))
+                         (max (1+ (gethash peer (raft-node-match-index node) 0))
+                              (or (getf msg :next-index)
+                                  (1- (gethash peer (raft-node-next-index node) 1))))))
+              ;; Anchor recovery to the actual refused new index. A later local
+              ;; checkpoint must not move this target while an image is in flight,
+              ;; and a delayed refusal behind known progress cannot revoke the proof.
+              (let ((refused (getf msg :next-index)))
+                (when (and (getf msg :capacity-limited)
+                           (typep refused '(integer 1 #.most-positive-fixnum))
+                           (> refused (gethash peer (raft-node-match-index node) 0))
+                           (<= refused (raft-node-snapshot-index node)))
+                  (setf (gethash peer (raft-node-peer-snapshot-required node))
+                        (max refused (if (integerp required) required 0))))))))
+      (when (raft-node-pending-reads node)
+        (raft-process-reads node)))))
 
 (defun raft-validate-snapshot-envelope (state)
   (unless (raft-snapshot-envelope-p state) (error "Unsupported snapshot envelope"))
@@ -1309,8 +1338,10 @@ Protocol-only traffic remains available to establish a recovery commit."
              (<= 0 (getf msg :match-index) (raft-last-log-index node)))
     (let ((peer (getf msg :from)) (index (getf msg :match-index)))
       (setf (gethash peer (raft-node-recent-active node)) t)
-      (when (>= index (raft-node-snapshot-index node))
-        (remhash peer (raft-node-peer-snapshot-required node)))
+      ;; Clear the snapshot preference only once the receiver has reached the
+      ;; refused recovery index this leader anchored, not merely the current
+      ;; snapshot boundary, so a stale ack cannot free a prefix moved past it.
+      (raft-note-peer-recovery-progress node peer index)
       (setf (gethash peer (raft-node-match-index node))
             (max index (gethash peer (raft-node-match-index node) 0))
             (gethash peer (raft-node-next-index node))
