@@ -148,7 +148,19 @@ PREPARE-FN receives the canonical path under its lease, before data-file creatio
   (ironclad:byte-array-to-hex-string
    (ironclad:digest-sequence :sha256 (trivial-utf-8:string-to-utf-8-bytes text))))
 
-(defconstant +raft-wal-frame-magic+ "@CLRAFTW1 ")
+(defmacro define-constant (name value &optional documentation)
+  "Like DEFCONSTANT, but safe to re-evaluate when VALUE is EQUAL but not EQL to
+the current binding -- as strings and vectors always are across compilations.
+Loading the compiled file a second time would otherwise signal DEFCONSTANT-UNEQL."
+  (let ((new (gensym "VALUE")))
+    `(defconstant ,name
+       (let ((,new ,value))
+         (if (and (boundp ',name) (equal (symbol-value ',name) ,new))
+             (symbol-value ',name)
+             ,new))
+       ,@(when documentation (list documentation)))))
+
+(define-constant +raft-wal-frame-magic+ "@CLRAFTW1 ")
 (defconstant +raft-wal-header-length+ 157)
 
 (defun raft-wal-write-frame (form stream)
