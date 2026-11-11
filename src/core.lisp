@@ -106,14 +106,42 @@
   ;; (no leader yet) elects promptly (podster-8r7).
   (leader-contact-elapsed 1000000 :type fixnum)
   (heartbeat-timeout 1 :type fixnum)
+  ;; Default election timeouts are drawn uniformly from [BASE, 2*BASE) so members
+  ;; rarely time out together and split the vote. Each node seeds its own state
+  ;; from OS entropy at construction: SBCL's global *RANDOM-STATE* is identical in
+  ;; every fresh process, which would hand all members the same "random" sequence.
+  (election-timeout-base 10 :type (integer 1 *))
+  (random-state (make-random-state t))
+  ;; CheckQuorum (Raft dissertation §6.2): a leader that has not heard from a
+  ;; quorum within an election timeout steps down, so clients stranded on the
+  ;; minority side of a partition fail fast instead of waiting forever.
+  (check-quorum t)
+  (check-quorum-elapsed 0 :type fixnum)
+  (recent-active (make-hash-table :test 'equal))      ; peer -> T, heard this period
+  ;; Leadership transfer (dissertation §3.10): target id, ticks spent, and
+  ;; whether TimeoutNow has been sent. Proposals are refused while set.
+  lead-transferee
+  (transfer-elapsed 0 :type fixnum)
+  (transfer-sent nil)
+  ;; ReadIndex (dissertation §6.4). Each read request bumps READ-SEQ, which rides
+  ;; on the next AppendEntries; followers echo it. A read is confirmed once a
+  ;; quorum has echoed its sequence in this term, and served after apply catches
+  ;; up to the commit index captured when it arrived. PENDING-READS holds
+  ;; (seq read-index . callback) in arrival order.
+  (read-seq 0 :type fixnum)
+  (read-acks (make-hash-table :test 'equal))         ; peer -> highest echoed seq
+  (pending-reads nil)
   ;; injectables
   send-fn                               ; (lambda (to message-plist))
   apply-fn                              ; (lambda (command) -> result)
   storage                               ; a RAFT-STORAGE for durable hard-state/log, or NIL
   snapshot-fn                           ; (lambda () -> opaque state-machine snapshot)
   restore-fn                            ; (lambda (snapshot)) restores the state machine
-  (timeout-fn (lambda () 10))           ; -> next election timeout (randomized in prod)
-  ;; leader: commit-index -> list of (client-callback . nil); resolved on apply
+  ;; -> next election timeout in ticks; NIL draws from [ELECTION-TIMEOUT-BASE,
+  ;; 2*ELECTION-TIMEOUT-BASE) with this node's own RANDOM-STATE.
+  (timeout-fn nil)
+  ;; leader: log index -> (term . client-callback), resolved on apply only when
+  ;; the committed entry at that index still carries the proposing term.
   (pending (make-hash-table :test 'eql)))
 
 ;;; ---------------------------------------------------------------------------
@@ -125,6 +153,12 @@
   (:method ((storage null) term vote) (declare (ignore term vote)) nil))
 (defgeneric raft-storage-append-entry (storage entry)
   (:method ((storage null) entry) (declare (ignore entry)) nil))
+(defgeneric raft-storage-append-entries (storage entries)
+  (:documentation "Durably append ENTRIES, a list in index order, before returning.
+Storage that can share one sync across the batch should specialize this; the
+default appends each entry individually.")
+  (:method (storage entries)
+    (dolist (entry entries) (raft-storage-append-entry storage entry))))
 (defgeneric raft-storage-truncate (storage index)
   (:method ((storage null) index) (declare (ignore index)) nil))
 (defgeneric raft-storage-save-commit-index (storage index)
@@ -219,6 +253,20 @@ is a borrowed sequence; retain only entries after INDEX. Caller holds the node l
   (vector-push-extend entry (raft-node-log node))
   entry)
 
+(defun raft-log-append-entries (node entries)
+  "Persist ENTRIES (a list) with one durable write, then publish them in order.
+Equivalent to RAFT-LOG-APPEND on each entry, but storage may sync once."
+  (when entries
+    (loop for entry in entries for index from (1+ (raft-last-log-index node))
+          do (setf (raft-entry-index entry) index))
+    (when (some (lambda (entry) (let ((command (raft-entry-command entry)))
+                                  (and (consp command) (eq :raft-config (car command)))))
+                entries)
+      (raft-storage-save-commit-index (raft-node-storage node) (raft-node-commit-index node)))
+    (raft-storage-append-entries (raft-node-storage node) entries)
+    (dolist (entry entries) (vector-push-extend entry (raft-node-log node))))
+  entries)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Snapshot / compaction.
 
@@ -267,6 +315,11 @@ is a borrowed sequence; retain only entries after INDEX. Caller holds the node l
                  (incf count))) entries)
     (loop for i from count below end do (setf (aref log i) nil))
     (setf (fill-pointer log) count))
+  ;; Entries covered by an installed snapshot are never applied here, so their
+  ;; results are unknowable locally; release any callbacks waiting on them.
+  (loop for pending-index being the hash-keys of (raft-node-pending node)
+        when (<= pending-index index) collect pending-index into stale
+        finally (dolist (i stale) (remhash i (raft-node-pending node))))
   (setf (raft-node-snapshot-index node) index (raft-node-snapshot-term node) term
         (raft-node-snapshot-state node) state (raft-node-last-applied node) index
         (raft-node-commit-index node) index))
@@ -413,9 +466,25 @@ an atomic replacement, including its log-tail policy, before calling this helper
 
 (defun raft-reset-election-timer (node)
   "Restart NODE's election timer: zero the elapsed count and draw a fresh
-   timeout from its timeout-fn (randomized in production)."
+   timeout from its timeout-fn, or uniformly from [base, 2*base) by default."
   (setf (raft-node-election-elapsed node) 0
-        (raft-node-election-timeout node) (funcall (raft-node-timeout-fn node))))
+        (raft-node-election-timeout node)
+        (if (raft-node-timeout-fn node)
+            (funcall (raft-node-timeout-fn node))
+            (let ((base (raft-node-election-timeout-base node)))
+              (+ base (random base (raft-node-random-state node)))))))
+
+(defun raft-fail-pending-reads (node)
+  "Leadership is gone or reset: no pending read can be confirmed any more."
+  (let ((reads (raft-node-pending-reads node)))
+    (setf (raft-node-pending-reads node) nil)
+    (clrhash (raft-node-read-acks node))
+    (dolist (read reads) (funcall (cddr read) nil))))
+
+(defun raft-clear-transfer (node)
+  (setf (raft-node-lead-transferee node) nil
+        (raft-node-transfer-elapsed node) 0
+        (raft-node-transfer-sent node) nil))
 
 (defun raft-become-follower (node term &optional leader-id)
   "Revert NODE to a follower at TERM (optionally knowing LEADER-ID): clear its
@@ -431,7 +500,10 @@ an atomic replacement, including its log-tail policy, before calling this helper
         (raft-node-leader-contact-elapsed node) (if leader-id 0 1000000))
   (clrhash (raft-node-pending-members node))   ; abandon any in-flight add on leadership loss
   (clrhash (raft-node-departing-members node)) ; a new leader restarts removal delivery
-  (raft-reset-election-timer node))
+  (raft-clear-transfer node)
+  (raft-reset-election-timer node)
+  ;; Last: read callbacks may re-enter the node, which is now a consistent follower.
+  (raft-fail-pending-reads node))
 
 (defun raft-send (node to message)
   "Hand MESSAGE to NODE's injected transport for delivery to member TO."
@@ -467,10 +539,11 @@ an atomic replacement, including its log-tail policy, before calling this helper
                                 :last-log-index (raft-last-log-index node)
                                 :last-log-term (raft-last-log-term node)))))))
 
-(defun raft-become-candidate (node)
+(defun raft-become-candidate (node &optional transfer)
   "Start an election: advance to the next term as a candidate, vote for self,
    persist the hard state, restart the election timer, and request votes from
-   every peer. Wins at once in a single-node cluster."
+   every peer. Wins at once in a single-node cluster. TRANSFER marks an election
+   the old leader asked for with TimeoutNow; it skips Pre-Vote by construction."
   (raft-set-hard-state node (1+ (raft-node-current-term node)) (raft-node-id node))
   (setf (raft-node-pre-vote-term node) nil)
   (setf (raft-node-role node) :candidate)
@@ -485,7 +558,8 @@ an atomic replacement, including its log-tail policy, before calling this helper
                           :term (raft-node-current-term node)
                           :from (raft-node-id node)
                           :last-log-index (raft-last-log-index node)
-                          :last-log-term (raft-last-log-term node))))
+                          :last-log-term (raft-last-log-term node)
+                          :leader-transfer (and transfer t))))
   ;; A single-node cluster wins immediately.
   (raft-maybe-become-leader node))
 
@@ -498,9 +572,21 @@ an atomic replacement, including its log-tail policy, before calling this helper
 
 (defun raft-become-leader (node)
   "Assume leadership: reset the per-peer next/match-index for everyone replicated
-   to and broadcast an immediate AppendEntries to assert the new term."
+   to, append a no-op barrier for the new term, and broadcast an immediate
+   AppendEntries to assert the term.
+
+   The barrier matters (Raft §5.4.2, §8): a leader may only commit entries from
+   earlier terms indirectly, by committing one of its own. Without it, an entry a
+   deposed leader replicated to a majority stays uncommitted until some client
+   happens to write, and the leader cannot know its own commit index -- which
+   ReadIndex and membership changes both depend on."
   (setf (raft-node-role node) :leader
-        (raft-node-leader-id node) (raft-node-id node))
+        (raft-node-leader-id node) (raft-node-id node)
+        (raft-node-check-quorum-elapsed node) 0
+        (raft-node-read-seq node) 0)
+  (clrhash (raft-node-recent-active node))
+  (clrhash (raft-node-read-acks node))
+  (raft-clear-transfer node)
   (clrhash (raft-node-next-index node))
   (clrhash (raft-node-match-index node))
   (clrhash (raft-node-peer-applied node))
@@ -508,8 +594,14 @@ an atomic replacement, including its log-tail policy, before calling this helper
   (dolist (peer (raft-replicate-ids node))
     (setf (gethash peer (raft-node-next-index node)) (1+ (raft-last-log-index node))
           (gethash peer (raft-node-match-index node)) 0))
+  (let ((barrier (raft-log-append node (make-raft-entry :term (raft-node-current-term node)
+                                                        :command '(:raft-barrier)))))
+    (setf (gethash (raft-node-id node) (raft-node-match-index node)) (raft-entry-index barrier)))
   ;; Replicate immediately to assert leadership.
-  (raft-broadcast-append node))
+  (raft-broadcast-append node)
+  ;; A single-member cluster commits its barrier at once.
+  (raft-advance-commit node)
+  (raft-apply-committed node))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Leader replication.
@@ -555,7 +647,7 @@ alone so existing persisted commands remain deliverable."
       (return-from raft-append-message
         (list :type :append-entries :term (raft-node-current-term node) :from (raft-node-id node)
               :prev-log-index (1- next) :prev-log-term (car cached) :entries (cdr cached)
-              :leader-commit (raft-node-commit-index node))))
+              :leader-commit (raft-node-commit-index node) :read-seq (raft-node-read-seq node))))
     (let* ((prev-index (1- next))
          (bytes 0)
          (entries
@@ -582,7 +674,8 @@ alone so existing persisted commands remain deliverable."
           :prev-log-index prev-index
           :prev-log-term (raft-log-term node prev-index)
           :entries entries
-          :leader-commit (raft-node-commit-index node)))))
+          :leader-commit (raft-node-commit-index node)
+          :read-seq (raft-node-read-seq node)))))
 
 (defun raft-broadcast-append (node)
   "Send every replicated member (peers, joiners, and departing members) an
@@ -635,13 +728,18 @@ alone so existing persisted commands remain deliverable."
                                :configured)
                         (if (equal command '(:raft-barrier)) :barrier
                             (and (raft-node-apply-fn node) (funcall (raft-node-apply-fn node) command)))))
-                  (callback (gethash index (raft-node-pending node))))
+                  (pending (gethash index (raft-node-pending node))))
              ;; A failed application must be retried at this exact log position.
              ;; Callback failures, in contrast, must never apply the command twice.
              (setf (raft-node-last-applied node) index)
-             (when callback
+             (when pending
                (remhash index (raft-node-pending node))
-               (funcall callback result)))))
+               ;; A deposed leader's uncommitted entry may have been replaced by a
+               ;; different entry at the same index. That entry's result belongs to
+               ;; another client, so the stale callback is dropped, never resolved.
+               (when (= (car pending) (raft-entry-term entry))
+                 (funcall (cdr pending) result)))))
+  (when (raft-node-pending-reads node) (raft-process-reads node)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Client proposal (leader only).
@@ -652,14 +750,20 @@ alone so existing persisted commands remain deliverable."
 
 (defun raft-proposal-capacity-reason (node command)
   "Check admission before append using the node's configured command estimator."
+  (raft-proposals-capacity-reason node (list command)))
+
+(defun raft-proposals-capacity-reason (node commands)
+  "Admission check for COMMANDS appended together; exempt commands cost nothing."
   (let ((limit (raft-node-uncommitted-byte-limit node))
-        (retained-limit (raft-node-retained-byte-limit node)))
-    (when (and (or limit retained-limit) (not (raft-capacity-exempt-command-p command)))
-      (let* ((bytes (+ 128 (funcall (raft-node-uncommitted-weight-fn node) command)))
+        (retained-limit (raft-node-retained-byte-limit node))
+        (counted (remove-if #'raft-capacity-exempt-command-p commands)))
+    (when (and (or limit retained-limit) counted)
+      (let* ((bytes (loop for command in counted
+                          sum (+ 128 (funcall (raft-node-uncommitted-weight-fn node) command))))
              (retained bytes)
              (pending-start (max 0 (- (raft-node-commit-index node) (raft-node-snapshot-index node)))))
         (when (or (and limit (> bytes limit)) (and retained-limit (> bytes retained-limit)))
-          (return-from raft-proposal-capacity-reason :proposal-too-large))
+          (return-from raft-proposals-capacity-reason :proposal-too-large))
         (loop for offset from (if retained-limit 0 pending-start)
                 below (length (raft-node-log node))
               for entry = (aref (raft-node-log node) offset)
@@ -667,26 +771,136 @@ alone so existing persisted commands remain deliverable."
               do (incf retained weight)
                  (when (>= offset pending-start) (incf bytes weight))
                  (when (or (and limit (> bytes limit)) (and retained-limit (> retained retained-limit)))
-                   (return-from raft-proposal-capacity-reason :capacity)))))))
+                   (return-from raft-proposals-capacity-reason :capacity)))))))
 
 (defun raft-propose (node command &optional callback)
   "Leader appends COMMAND and replicates it. CALLBACK (if given) is invoked with
    the state-machine result once the entry commits. Returns (values index t) on
    the leader, or (values nil nil reason) on refusal. Capacity refusal does not
    append, persist, send, or retain CALLBACK."
-  (when (and (eq (raft-node-role node) :leader) (not (raft-node-snapshot-pending node)))
-    (let ((reason (raft-proposal-capacity-reason node command)))
-      (when reason (return-from raft-propose (values nil nil reason)))))
-  (if (and (eq (raft-node-role node) :leader) (not (raft-node-snapshot-pending node)))
-      (let ((entry (raft-log-append node (make-raft-entry :term (raft-node-current-term node)
-                                                          :command command))))
-        (when callback (setf (gethash (raft-entry-index entry) (raft-node-pending node)) callback))
-        (setf (gethash (raft-node-id node) (raft-node-match-index node)) (raft-entry-index entry))
-        (raft-broadcast-append node)
-        (raft-advance-commit node)
-        (raft-apply-committed node)
-        (values (raft-entry-index entry) t))
-      (values nil nil :not-leader)))
+  (multiple-value-bind (first last reason)
+      (raft-propose-batch node (list command) (list callback))
+    (declare (ignore last))
+    (if first (values first t) (values nil nil reason))))
+
+(defun raft-propose-batch (node commands &optional callbacks)
+  "Leader appends COMMANDS (a non-empty list) as consecutive entries with a
+   single durable write and one replication round. CALLBACKS, if given, is a list
+   parallel to COMMANDS; each non-NIL element is invoked with its command's
+   state-machine result once that entry commits. Returns (values first-index
+   last-index) on the leader, or (values nil nil reason) on refusal, in which case
+   nothing is appended. Reasons: :not-leader, :transferring (a leadership transfer
+   is in progress; retry at the new leader), or a capacity reason."
+  (unless (and commands (listp commands)) (error "RAFT-PROPOSE-BATCH requires a non-empty list"))
+  (unless (and (listp callbacks) (<= (length callbacks) (length commands)))
+    (error "CALLBACKS must be a list no longer than COMMANDS"))
+  (cond
+    ((or (not (eq (raft-node-role node) :leader)) (raft-node-snapshot-pending node))
+     (values nil nil :not-leader))
+    ((raft-node-lead-transferee node) (values nil nil :transferring))
+    (t
+     (let ((reason (raft-proposals-capacity-reason node commands)))
+       (when reason (return-from raft-propose-batch (values nil nil reason))))
+     (let* ((term (raft-node-current-term node))
+            (entries (raft-log-append-entries
+                      node (mapcar (lambda (command) (make-raft-entry :term term :command command))
+                                   commands)))
+            (last (raft-entry-index (car (last entries)))))
+       (loop for entry in entries for callback in callbacks
+             when callback
+               do (setf (gethash (raft-entry-index entry) (raft-node-pending node))
+                        (cons term callback)))
+       (setf (gethash (raft-node-id node) (raft-node-match-index node)) last)
+       (raft-broadcast-append node)
+       (raft-advance-commit node)
+       (raft-apply-committed node)
+       (values (raft-entry-index (first entries)) last)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Linearizable reads (ReadIndex, Raft dissertation §6.4).
+
+(defun raft-read-index (node callback)
+  "Request a linearizable read without writing to the log. On the leader, captures
+   the commit index, confirms leadership with one heartbeat round acknowledged by
+   a quorum, waits until that index is applied, then calls (CALLBACK read-index):
+   the local state machine now reflects every write committed before this call,
+   so the caller may read it. If leadership is lost first, CALLBACK receives NIL.
+
+   Returns T if the read was queued (CALLBACK will be called exactly once), or
+   (values nil reason) without calling CALLBACK: :not-leader, or :not-ready if
+   this leader has not yet committed its election barrier (retry shortly)."
+  (cond
+    ((or (not (eq (raft-node-role node) :leader)) (raft-node-snapshot-pending node))
+     (values nil :not-leader))
+    ((/= (raft-log-term node (raft-node-commit-index node)) (raft-node-current-term node))
+     (values nil :not-ready))
+    (t
+     (let ((seq (incf (raft-node-read-seq node))))
+       (setf (raft-node-pending-reads node)
+             (nconc (raft-node-pending-reads node)
+                    (list (list* seq (raft-node-commit-index node) callback))))
+       ;; Alone in the quorum, leadership needs no confirmation.
+       (unless (= 1 (raft-majority node)) (raft-broadcast-append node))
+       (raft-process-reads node)
+       t))))
+
+(defun raft-read-confirmed-p (node seq)
+  (>= (1+ (loop for peer in (raft-node-peers node)
+                count (>= (gethash peer (raft-node-read-acks node) 0) seq)))
+      (raft-majority node)))
+
+(defun raft-process-reads (node)
+  "Serve queued reads, in order, whose leadership round a quorum has confirmed
+   and whose read index has been applied."
+  (loop for read = (first (raft-node-pending-reads node))
+        while (and read (eq (raft-node-role node) :leader)
+                   (raft-read-confirmed-p node (car read))
+                   (>= (raft-node-last-applied node) (cadr read)))
+        do (pop (raft-node-pending-reads node))
+           (funcall (cddr read) (cadr read))))
+
+;;; ---------------------------------------------------------------------------
+;;; Leadership transfer (Raft dissertation §3.10).
+
+(defun raft-transfer-leadership (node target)
+  "Hand leadership to voter TARGET, e.g. before restarting this member. The
+   leader stops accepting proposals, brings TARGET's log up to date, then sends
+   it TimeoutNow so it starts an election immediately -- without waiting out an
+   election timeout or a Pre-Vote round. If TARGET has not taken over within one
+   election timeout, the transfer is abandoned and proposals resume.
+
+   Returns T if the transfer started, or (values nil reason): :not-leader,
+   :self, or :not-voter (TARGET is not a voting peer)."
+  (cond
+    ((not (eq (raft-node-role node) :leader)) (values nil :not-leader))
+    ((equal target (raft-node-id node)) (values nil :self))
+    ((not (and (member target (raft-node-peers node) :test #'equal)
+               (eq :voter (raft-member-role node target))))
+     (values nil :not-voter))
+    (t
+     (raft-clear-transfer node)
+     (setf (raft-node-lead-transferee node) target)
+     (raft-maybe-send-timeout-now node)
+     (unless (raft-node-transfer-sent node)
+       (raft-send node target (raft-append-message node target)))
+     t)))
+
+(defun raft-maybe-send-timeout-now (node)
+  (let ((target (raft-node-lead-transferee node)))
+    (when (and target (not (raft-node-transfer-sent node))
+               (= (gethash target (raft-node-match-index node) 0) (raft-last-log-index node)))
+      (setf (raft-node-transfer-sent node) t)
+      (raft-send node target (list :type :timeout-now :term (raft-node-current-term node)
+                                   :from (raft-node-id node))))))
+
+(defun raft-handle-timeout-now (node msg)
+  "The leader asked this member to take over: campaign at once, skipping Pre-Vote."
+  (raft-step-down-if-stale node (getf msg :term))
+  (when (and (= (getf msg :term) (raft-node-current-term node))
+             (not (eq (raft-node-role node) :leader))
+             (eq :voter (raft-node-self-role node))
+             (not (raft-node-removed node)))
+    (raft-become-candidate node t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Membership change (single-member, effective on commit).
@@ -768,6 +982,12 @@ following leadership changes; old peers without applied receipts cannot qualify.
     (error "Promotion intent requires adding a learner with voter intent"))
   (cond
     ((not (eq (raft-node-role node) :leader)) (values nil :not-leader))
+    ((raft-node-lead-transferee node) (values nil :transferring))
+    ;; Single-server changes are only safe once this leader has committed an
+    ;; entry of its own term (Ongaro, raft-dev 2015 erratum to dissertation §4.1);
+    ;; the election barrier provides one promptly.
+    ((/= (raft-log-term node (raft-node-commit-index node)) (raft-node-current-term node))
+     (values nil :not-ready))
     ((raft-config-change-in-flight-p node) (values nil :change-in-flight))
     ((and add (eq role :voter) (eq :learner (gethash add (raft-node-roles node)))
           (not (raft-peer-ready-for-promotion-p node add)))
@@ -922,7 +1142,7 @@ Protocol-only traffic remains available to establish a recovery commit."
     (cond
       ((< term (raft-node-current-term node))
        (raft-send node leader (list :type :append-entries-reply
-                                    :term (raft-node-current-term node) :from (raft-node-id node)
+                                    :term (raft-node-current-term node) :from (raft-node-id node) :read-seq (getf msg :read-seq)
                                     :success nil :match-index 0)))
       (t
        ;; Valid leader for our term.
@@ -934,7 +1154,7 @@ Protocol-only traffic remains available to establish a recovery commit."
              (prev-term (getf msg :prev-log-term)))
          (when (< prev-index (raft-node-snapshot-index node))
            (raft-send node leader (list :type :append-entries-reply
-                                       :term (raft-node-current-term node) :from (raft-node-id node)
+                                       :term (raft-node-current-term node) :from (raft-node-id node) :read-seq (getf msg :read-seq)
                                        :success nil :match-index 0
                                        :next-index (1+ (raft-node-snapshot-index node))))
            (return-from raft-handle-append-entries nil))
@@ -943,7 +1163,7 @@ Protocol-only traffic remains available to establish a recovery commit."
                       (/= (raft-log-term node prev-index) prev-term)))
              ;; Log mismatch: reject so the leader backs up.
              (raft-send node leader (list :type :append-entries-reply
-                                          :term (raft-node-current-term node) :from (raft-node-id node)
+                                          :term (raft-node-current-term node) :from (raft-node-id node) :read-seq (getf msg :read-seq)
                                           :success nil :match-index 0))
              (progn
                (let ((next (raft-replication-capacity-index node prev-index (getf msg :entries))))
@@ -955,24 +1175,29 @@ Protocol-only traffic remains available to establish a recovery commit."
                      (raft-set-commit-index node (min (getf msg :leader-commit) prev-index)))
                    (raft-apply-committed node)
                    (raft-send node leader (list :type :append-entries-reply
-                                               :term (raft-node-current-term node) :from (raft-node-id node)
+                                               :term (raft-node-current-term node) :from (raft-node-id node) :read-seq (getf msg :read-seq)
                                                :success nil :match-index 0 :next-index next
                                                :capacity-limited t))
                    (return-from raft-handle-append-entries nil)))
                ;; Append/overwrite, skipping entries we already agree on.
-               (loop for entry in (getf msg :entries)
+               ;; Find the first entry we do not already hold, truncate a
+               ;; conflicting suffix once, and persist the rest in one write.
+               (loop for tail on (getf msg :entries)
                      for i from (1+ prev-index)
-                     do (cond ((> i (raft-log-length node)) (raft-log-append node (copy-raft-entry entry)))
-                              ((/= (raft-log-term node i) (raft-entry-term entry))
+                     do (cond ((> i (raft-log-length node))
+                               (raft-log-append-entries node (mapcar #'copy-raft-entry tail))
+                               (return))
+                              ((/= (raft-log-term node i) (raft-entry-term (car tail)))
                                (raft-log-truncate node i)
-                               (raft-log-append node (copy-raft-entry entry)))))
+                               (raft-log-append-entries node (mapcar #'copy-raft-entry tail))
+                               (return))))
                (let ((last-new (+ prev-index (length (getf msg :entries)))))
                  (when (> (getf msg :leader-commit) (raft-node-commit-index node))
                    (raft-set-commit-index node (min (getf msg :leader-commit) last-new)))
                  (raft-apply-committed node)
                  (raft-send node leader (list :type :append-entries-reply
                                               :term (raft-node-current-term node)
-                                              :from (raft-node-id node)
+                                              :from (raft-node-id node) :read-seq (getf msg :read-seq)
                                               :success t :match-index last-new
                                               :applied-index (min last-new (raft-node-last-applied node))))))))))))
 
@@ -985,6 +1210,11 @@ Protocol-only traffic remains available to establish a recovery commit."
   (when (and (eq (raft-node-role node) :leader)
              (= (getf msg :term) (raft-node-current-term node)))
     (let ((peer (getf msg :from)))
+      ;; Any same-term reply, success or not, shows PEER still follows us.
+      (setf (gethash peer (raft-node-recent-active node)) t)
+      (let ((seq (getf msg :read-seq)))
+        (when (and (typep seq 'fixnum) (> seq (gethash peer (raft-node-read-acks node) 0)))
+          (setf (gethash peer (raft-node-read-acks node)) seq)))
       (if (getf msg :success)
           (progn
             (setf (gethash peer (raft-node-match-index node)) (getf msg :match-index)
@@ -1003,7 +1233,8 @@ Protocol-only traffic remains available to establish a recovery commit."
                               (max applied (if (and prior (= (car prior) (raft-node-current-term node)))
                                                (cdr prior) 0)))))))
             (raft-advance-commit node)
-            (raft-apply-committed node))
+            (raft-apply-committed node)
+            (when (eq (raft-node-role node) :leader) (raft-maybe-send-timeout-now node)))
           ;; Back up and retry on the next replication round.
           (progn
             (setf (gethash peer (raft-node-next-index node))
@@ -1018,7 +1249,8 @@ Protocol-only traffic remains available to establish a recovery commit."
                        (member peer (raft-replicate-ids node) :test #'equal)
                        (<= (gethash peer (raft-node-next-index node))
                            (raft-node-snapshot-index node)))
-              (setf (gethash peer (raft-node-peer-snapshot-required node)) t)))))))
+              (setf (gethash peer (raft-node-peer-snapshot-required node)) t))))
+      (when (raft-node-pending-reads node) (raft-process-reads node)))))
 
 (defun raft-validate-snapshot-envelope (state)
   (unless (raft-snapshot-envelope-p state) (error "Unsupported snapshot envelope"))
@@ -1076,6 +1308,7 @@ Protocol-only traffic remains available to establish a recovery commit."
              (member (getf msg :from) (raft-replicate-ids node) :test #'equal)
              (<= 0 (getf msg :match-index) (raft-last-log-index node)))
     (let ((peer (getf msg :from)) (index (getf msg :match-index)))
+      (setf (gethash peer (raft-node-recent-active node)) t)
       (when (>= index (raft-node-snapshot-index node))
         (remhash peer (raft-node-peer-snapshot-required node)))
       (setf (gethash peer (raft-node-match-index node))
@@ -1097,7 +1330,8 @@ Protocol-only traffic remains available to establish a recovery commit."
     (:append-entries (raft-handle-append-entries node msg))
     (:append-entries-reply (raft-handle-append-entries-reply node msg))
     (:install-snapshot (raft-handle-install-snapshot node msg))
-    (:install-snapshot-reply (raft-handle-install-snapshot-reply node msg))))
+    (:install-snapshot-reply (raft-handle-install-snapshot-reply node msg))
+    (:timeout-now (raft-handle-timeout-now node msg))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Logical clock.
@@ -1115,7 +1349,26 @@ Protocol-only traffic remains available to establish a recovery commit."
            (raft-begin-pre-election node))))
       (:leader
        (when (>= (incf (raft-node-heartbeat-elapsed node)) (raft-node-heartbeat-timeout node))
-         (raft-broadcast-append node))))))
+         (raft-broadcast-append node))
+       ;; A transfer that has not completed within an election timeout failed
+       ;; (target crashed, partitioned, or lost the election): resume service.
+       (when (and (raft-node-lead-transferee node)
+                  (>= (incf (raft-node-transfer-elapsed node)) (raft-node-election-timeout node)))
+         (raft-clear-transfer node))
+       (when (and (raft-node-check-quorum node)
+                  (>= (incf (raft-node-check-quorum-elapsed node)) (raft-node-election-timeout node)))
+         (raft-check-quorum node))))))
+
+(defun raft-check-quorum (node)
+  "Leader: step down unless a quorum (counting self) answered during the period
+   just ended, then start a fresh period. Without this, a leader cut off from the
+   majority keeps the role indefinitely and its clients' requests hang."
+  (let ((active (1+ (loop for peer in (raft-node-peers node)
+                          count (gethash peer (raft-node-recent-active node))))))
+    (clrhash (raft-node-recent-active node))
+    (setf (raft-node-check-quorum-elapsed node) 0)
+    (when (< active (raft-majority node))
+      (raft-become-follower node (raft-node-current-term node)))))
 
 (defun raft-leader-p (node)
   "True when NODE currently holds the leader role."

@@ -124,4 +124,13 @@
    #:raft-storage-replace-snapshot
    #:raft-storage-truncate
    #:raft-tick
+   #:raft-log-append-entries
+   #:raft-node-check-quorum
+   #:raft-node-election-timeout-base
+   #:raft-node-lead-transferee
+   #:raft-node-random-state
+   #:raft-propose-batch
+   #:raft-read-index
+   #:raft-storage-append-entries
+   #:raft-transfer-leadership
    #:recover-raft-node))

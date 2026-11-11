@@ -292,22 +292,39 @@ Legacy forms are read strictly; only explicit frame boundaries can be repaired."
      (loop for index being the hash-keys of frames
            when (<= index (second form)) do (remhash index frames)))))
 
+(defgeneric file-raft-append-sync (storage fd)
+  (:documentation "Make every frame appended so far durable before acknowledging it.")
+  (:method ((storage file-raft-storage) fd) (sb-posix:fsync fd)))
+
 (defun file-raft-write (storage form)
   "Append one checksummed frame and fsync it before acknowledging persistence."
+  (file-raft-write-batch storage (list form)))
+
+(defun file-raft-write-batch (storage forms)
+  "Append one checksummed frame per form, then fsync once before acknowledging
+any of them. Frames are byte-identical to individually written ones, so the
+recovery format is unchanged and nothing in the batch is acknowledged before the
+sync. As with any multi-page frame written before this change, a crash before
+the sync can persist the unsynced pages in any order: a short tail is repaired,
+while damage before the tail fails its checksum and recovery refuses to start."
   (let ((stream (file-raft-storage-stream storage)))
     (unless (and stream (open-stream-p stream))
       (error "Raft WAL is closed; recover it before writing"))
     (handler-case
-        (progn
+        (let ((spans '()))
           ;; A reopened O_APPEND descriptor initially has position zero. Seek
           ;; through the stream before observing its byte position.
           (file-position stream :end)
-          (let ((start (file-position stream)))
-            (raft-wal-write-frame form stream)
-            (finish-output stream)
-            (sb-posix:fsync (sb-sys:fd-stream-fd stream))
-            (raft-index-wal-frame (file-raft-storage-entry-frames storage)
-                                  form start (file-position stream))))
+          (dolist (form forms)
+            (let ((start (file-position stream)))
+              (raft-wal-write-frame form stream)
+              ;; Flush per frame so FILE-POSITION reports the frame's true end.
+              (finish-output stream)
+              (push (list form start (file-position stream)) spans)))
+          (file-raft-append-sync storage (sb-sys:fd-stream-fd stream))
+          ;; Publish frame offsets only after the whole batch is durable.
+          (loop for (form start end) in (nreverse spans)
+                do (raft-index-wal-frame (file-raft-storage-entry-frames storage) form start end)))
       (error (condition)
         ;; An uncertain partial append must not be followed by another append.
         ;; Retain the ownership lease until explicit close and recovery.
@@ -321,6 +338,14 @@ Legacy forms are read strictly; only explicit frame boundaries can be repaired."
 (defmethod raft-storage-append-entry ((storage file-raft-storage) entry)
   (file-raft-write storage (list :entry (raft-entry-index entry)
                                  (raft-entry-term entry) (raft-entry-command entry))))
+
+(defmethod raft-storage-append-entries ((storage file-raft-storage) entries)
+  (when entries
+    (file-raft-write-batch storage
+                           (mapcar (lambda (entry)
+                                     (list :entry (raft-entry-index entry)
+                                           (raft-entry-term entry) (raft-entry-command entry)))
+                                   entries))))
 
 (defmethod raft-storage-truncate ((storage file-raft-storage) index)
   (file-raft-write storage (list :truncate index)))
