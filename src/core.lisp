@@ -43,6 +43,13 @@
   ;; Optional coordinator backpressure while checkpoints lag committed writes.
   (retained-byte-limit nil :type (or null (integer 1 *)))
   (uncommitted-weight-fn #'raft-command-wire-weight :type function)
+  ;; What an entry costs a follower that retains it from replication, against
+  ;; RETAINED-BYTE-LIMIT. NIL charges what a proposal costs. An application whose
+  ;; proposal estimate reserves for a waiting client should set this to the
+  ;; entry's own size: a replicated entry has no waiter, and a follower that
+  ;; cannot compact yet -- one still recovering -- has only this budget in which
+  ;; to catch up with a leader that keeps writing.
+  (retained-weight-fn nil :type (or null function))
   ;; compaction: entries <= snapshot-index are discarded; snapshot-term is the
   ;; term of the last entry the snapshot includes. log[0] is index snapshot-index+1.
   (snapshot-index 0 :type fixnum)
@@ -1110,6 +1117,7 @@ following leadership changes; old peers without applied receipts cannot qualify.
 
 (defun raft-replication-capacity-index (node prev-index entries)
   "Return the first new index if a replicated suffix exceeds the retention budget.
+Entries are weighed by RETAINED-WEIGHT-FN when the node has one.
 Matching duplicates cost nothing; a conflicting suffix replaces the old one.
 Protocol-only traffic remains available to establish a recovery commit."
   (let ((limit (raft-node-retained-byte-limit node)))
@@ -1122,7 +1130,8 @@ Protocol-only traffic remains available to establish a recovery commit."
                    (error "Replication cannot overwrite the committed prefix"))
                  (when (some (lambda (entry) (not (raft-capacity-exempt-command-p (raft-entry-command entry))))
                              remaining)
-                   (let ((bytes 0) (weight (raft-node-uncommitted-weight-fn node)))
+                   (let ((bytes 0) (weight (or (raft-node-retained-weight-fn node)
+                                               (raft-node-uncommitted-weight-fn node))))
                      (loop for old across (raft-node-log node)
                            while (< (raft-entry-index old) index)
                            do (incf bytes (+ 128 (funcall weight (raft-entry-command old)))))

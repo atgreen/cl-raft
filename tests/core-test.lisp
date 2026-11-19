@@ -211,3 +211,25 @@
        (ignore-errors (uiop:delete-directory-tree
                        (uiop:pathname-directory-pathname ,path) :validate t :if-does-not-exist :ignore)))))
 
+
+(test a-follower-weighs-replicated-entries-by-their-own-estimator
+  ;; An application's proposal estimate may reserve for a waiting client: gr8s
+  ;; charges every proposal two memory pages. Charged that for each replicated
+  ;; entry, a 32 MB budget held 450 entries, and a recovering follower -- which
+  ;; cannot compact until it has caught up -- never caught up with a leader that
+  ;; committed more than that while a snapshot was sent and installed.
+  (flet ((first-refused (node count)
+           (cl-raft::raft-replication-capacity-index
+            node 0 (loop for index from 1 to count
+                         collect (cl-raft:make-raft-entry :index index :term 1 :command (list :put "k" index))))))
+    (let ((node (cl-raft:make-raft-node :id "follower")))
+      (setf (cl-raft::raft-node-retained-byte-limit node) (* 1024 1024)
+            (cl-raft::raft-node-uncommitted-weight-fn node)
+            (lambda (command) (declare (ignore command)) 65536))
+      (is (null (first-refused node 10)))
+      (is (eql 1 (first-refused node 100)) "at a proposal's price the budget holds fifteen entries")
+      (setf (cl-raft::raft-node-retained-weight-fn node)
+            (lambda (command) (declare (ignore command)) 100))
+      (is (null (first-refused node 100)))
+      (is (null (first-refused node 4000)))
+      (is (eql 1 (first-refused node 5000)) "the budget still binds, at the entry's own size"))))
