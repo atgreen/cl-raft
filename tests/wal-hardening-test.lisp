@@ -234,3 +234,20 @@
                    (with-standard-io-syntax
                      (let ((*package* (find-package :cl-raft)) (*read-eval* nil))
                        (read-from-string (trivial-utf-8:utf-8-bytes-to-string record))))))))))
+
+(defclass raft-test-unstable-record () ((printings :initform 0 :accessor raft-test-unstable-printings)))
+(defmethod print-object ((object raft-test-unstable-record) stream)
+  (write-string (if (= 1 (incf (raft-test-unstable-printings object))) ":FIRST" ":OTHER") stream))
+
+(test raft-wal-frames-a-record-from-one-printing
+  ;; Length and digest come from the text that is written. A record that prints
+  ;; differently every time is printed once and its frame passes its own check.
+  (let* ((unstable (make-instance 'raft-test-unstable-record))
+         (frame (raft-test-record-octets (list :entry 1 1 unstable)))
+         (record (subseq frame cl-raft::+raft-wal-header-length+))
+         (header (trivial-utf-8:utf-8-bytes-to-string (subseq frame 0 cl-raft::+raft-wal-header-length+))))
+    (is (= 1 (raft-test-unstable-printings unstable)))
+    (is (search ":FIRST" (trivial-utf-8:utf-8-bytes-to-string record)))
+    (is (= (length record) (parse-integer header :start 10 :end 26 :radix 16)))
+    (is (string= (subseq header 27 91)
+                 (ironclad:byte-array-to-hex-string (ironclad:digest-sequence :sha256 record))))))
