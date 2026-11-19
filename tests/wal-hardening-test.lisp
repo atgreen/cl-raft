@@ -215,3 +215,39 @@
   (when (repair-sync-failure storage) (error "Injected tail repair fsync failure"))
   (call-next-method))
 
+
+(test raft-wal-frame-headers-count-octets-and-digest-the-record
+  ;; The record is printed once and measured from that text. A character count
+  ;; would agree with the octet count for ASCII and for nothing else.
+  (dolist (form (list '(:hard 1 nil)
+                      (list :entry 9 3 (list :payload "naïve — 日本語 🙂"))
+                      (list :entry 10 3 (list :payload (format nil "quote \" backslash \\ line~%end")))
+                      (list :entry 11 3 (list :payload (make-string 200000 :initial-element #\é)))))
+    (let* ((frame (raft-test-record-octets form))
+           (header (trivial-utf-8:utf-8-bytes-to-string (subseq frame 0 cl-raft::+raft-wal-header-length+)))
+           (record (subseq frame cl-raft::+raft-wal-header-length+)))
+      (is (= (length record) (parse-integer header :start 10 :end 26 :radix 16)))
+      (is (string= (subseq header 27 91)
+                   (ironclad:byte-array-to-hex-string (ironclad:digest-sequence :sha256 record))))
+      (is (equal form
+                 (let ((*package* (find-package :cl-raft)))
+                   (with-standard-io-syntax
+                     (let ((*package* (find-package :cl-raft)) (*read-eval* nil))
+                       (read-from-string (trivial-utf-8:utf-8-bytes-to-string record))))))))))
+
+(defclass raft-test-unstable-record () ((printings :initform 0 :accessor raft-test-unstable-printings)))
+(defmethod print-object ((object raft-test-unstable-record) stream)
+  (write-string (if (= 1 (incf (raft-test-unstable-printings object))) ":FIRST" ":OTHER") stream))
+
+(test raft-wal-frames-a-record-from-one-printing
+  ;; Length and digest come from the text that is written. A record that prints
+  ;; differently every time is printed once and its frame passes its own check.
+  (let* ((unstable (make-instance 'raft-test-unstable-record))
+         (frame (raft-test-record-octets (list :entry 1 1 unstable)))
+         (record (subseq frame cl-raft::+raft-wal-header-length+))
+         (header (trivial-utf-8:utf-8-bytes-to-string (subseq frame 0 cl-raft::+raft-wal-header-length+))))
+    (is (= 1 (raft-test-unstable-printings unstable)))
+    (is (search ":FIRST" (trivial-utf-8:utf-8-bytes-to-string record)))
+    (is (= (length record) (parse-integer header :start 10 :end 26 :radix 16)))
+    (is (string= (subseq header 27 91)
+                 (ironclad:byte-array-to-hex-string (ironclad:digest-sequence :sha256 record))))))

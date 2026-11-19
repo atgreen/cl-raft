@@ -103,46 +103,30 @@ PREPARE-FN receives the canonical path under its lease, before data-file creatio
         (when stream (ignore-errors (close stream :abort t)))
         (when ownership-fd (sb-posix:close ownership-fd))))))
 
-;;; Framing protects record boundaries without building a whole printed record.
-;;; A counting SHA-256 sink is the first printer pass; the second writes the WAL.
-(defclass raft-wal-digest-stream (sb-gray:fundamental-binary-output-stream)
-  ((digest :initform (ironclad:make-digest :sha256) :reader wal-stream-digest)
-   (count :initform 0 :accessor wal-stream-count)
-   (buffer :initform (make-array 4096 :element-type '(unsigned-byte 8)) :reader wal-stream-buffer)
-   (used :initform 0 :accessor wal-stream-used)))
+;;; Framing protects record boundaries. A record is printed once, into a string:
+;;; its length and digest are taken from that string's octets and the same string
+;;; is written to the WAL. Printing it twice through a byte-at-a-time digest
+;;; stream kept one copy out of memory and cost about 250 ns a byte, all of it
+;;; under the caller's lock: 130 ms for a 500 kB entry before any disk was touched.
+(defun raft-wal-record-text (form)
+  "FORM as its WAL record text, trailing newline included. The caller binds the
+printer variables."
+  (with-output-to-string (text)
+    (prin1 form text)
+    (terpri text)))
 
-(defmethod stream-element-type ((stream raft-wal-digest-stream)) '(unsigned-byte 8))
-
-(defun wal-stream-flush (stream)
-  (when (plusp (wal-stream-used stream))
-    (ironclad:update-digest (wal-stream-digest stream) (wal-stream-buffer stream)
-                            :end (wal-stream-used stream))
-    (setf (wal-stream-used stream) 0)))
-
-(defmethod sb-gray:stream-write-byte ((stream raft-wal-digest-stream) byte)
-  (setf (aref (wal-stream-buffer stream) (wal-stream-used stream)) byte)
-  (incf (wal-stream-used stream))
-  (incf (wal-stream-count stream))
-  (when (= (wal-stream-used stream) (length (wal-stream-buffer stream))) (wal-stream-flush stream))
-  byte)
-
-(defmethod sb-gray:stream-write-sequence ((stream raft-wal-digest-stream) sequence &optional (start 0) end)
-  (wal-stream-flush stream)
-  (let ((end (or end (length sequence))))
-    (ironclad:update-digest (wal-stream-digest stream) sequence :start start :end end)
-    (incf (wal-stream-count stream) (- end start)))
-  sequence)
+(defun raft-wal-text-metrics (text)
+  "The length in octets of TEXT as UTF-8 and the hex SHA-256 of those octets."
+  (let ((octets (trivial-utf-8:string-to-utf-8-bytes text)))
+    (values (length octets)
+            (ironclad:byte-array-to-hex-string (ironclad:digest-sequence :sha256 octets)))))
 
 (defun raft-wal-form-metrics (form &optional output)
-  (let ((sink (make-instance 'raft-wal-digest-stream)))
-    (with-open-stream (text (flexi-streams:make-flexi-stream sink :external-format :utf-8))
-      (let ((printer (if output (make-broadcast-stream output text) text)))
-        (prin1 form printer)
-        (terpri printer))
-      (finish-output text)
-      (wal-stream-flush sink)
-      (values (wal-stream-count sink)
-              (ironclad:byte-array-to-hex-string (ironclad:produce-digest (wal-stream-digest sink)))))))
+  "The octet length and digest of FORM's record, which is also written to the
+character stream OUTPUT when one is given."
+  (let ((text (raft-wal-record-text form)))
+    (when output (write-string text output))
+    (raft-wal-text-metrics text)))
 
 (defun raft-wal-text-sha256 (text)
   (ironclad:byte-array-to-hex-string
@@ -167,15 +151,14 @@ Loading the compiled file a second time would otherwise signal DEFCONSTANT-UNEQL
   (let ((*print-readably* t) (*print-circle* nil) (*print-pretty* nil)
         (*print-base* 10) (*print-radix* nil) (*print-case* :upcase)
         (*package* (find-package :cl-raft)))
-    (multiple-value-bind (length digest) (raft-wal-form-metrics form)
-      (unless (< 0 length (expt 16 16)) (error "Raft WAL record length is out of range"))
-      (let ((prefix (format nil "~A~16,'0X ~A " +raft-wal-frame-magic+ length digest)))
-        (write-string prefix stream)
-        (write-string (raft-wal-text-sha256 prefix) stream)
-        (terpri stream))
-      (multiple-value-bind (actual-length actual-digest) (raft-wal-form-metrics form stream)
-        (unless (and (= length actual-length) (equal digest actual-digest))
-          (error "Raft WAL record changed during serialization"))))))
+    (let ((text (raft-wal-record-text form)))
+      (multiple-value-bind (length digest) (raft-wal-text-metrics text)
+        (unless (< 0 length (expt 16 16)) (error "Raft WAL record length is out of range"))
+        (let ((prefix (format nil "~A~16,'0X ~A " +raft-wal-frame-magic+ length digest)))
+          (write-string prefix stream)
+          (write-string (raft-wal-text-sha256 prefix) stream)
+          (terpri stream))
+        (write-string text stream)))))
 
 (defun raft-wal-header-character-p (character position)
   (cond ((< position (length +raft-wal-frame-magic+))
