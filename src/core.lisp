@@ -1013,7 +1013,9 @@ following leadership changes; old peers without applied receipts cannot qualify.
     (error "Promotion intent requires adding a learner with voter intent"))
   (cond
     ((not (eq (raft-node-role node) :leader)) (values nil :not-leader))
-    ((raft-node-lead-transferee node) (values nil :transferring))
+    ;; A witness leading in a voter's place changes nothing but who leads.
+    ((or (raft-node-lead-transferee node) (eq :witness (raft-node-self-role node)))
+     (values nil :transferring))
     ;; Single-server changes are only safe once this leader has committed an
     ;; entry of its own term (Ongaro, raft-dev 2015 erratum to dissertation §4.1);
     ;; the election barrier provides one promptly.
