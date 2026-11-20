@@ -1228,10 +1228,15 @@ Protocol-only traffic remains available to establish a recovery commit."
          (if (or (> prev-index (raft-last-log-index node))
                  (and (> prev-index 0)
                       (/= (raft-log-term node prev-index) prev-term)))
-             ;; Log mismatch: reject so the leader backs up.
-             (raft-send node leader (list :type :append-entries-reply
-                                          :term (raft-node-current-term node) :from (raft-node-id node) :read-seq (getf msg :read-seq)
-                                          :success nil :match-index 0))
+             ;; Log mismatch: reject so the leader backs up. A log that is merely
+             ;; short says where it ends, so the leader resumes there in one step
+             ;; and not one entry per round: a witness standing in has a single
+             ;; election timeout in which to bring a voter level.
+             (raft-send node leader (list* :type :append-entries-reply
+                                           :term (raft-node-current-term node) :from (raft-node-id node) :read-seq (getf msg :read-seq)
+                                           :success nil :match-index 0
+                                           (when (> prev-index (raft-last-log-index node))
+                                             (list :next-index (1+ (raft-last-log-index node))))))
              (progn
                (let ((next (raft-replication-capacity-index node prev-index (getf msg :entries))))
                  (when next

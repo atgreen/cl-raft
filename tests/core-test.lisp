@@ -354,3 +354,19 @@
       (is (not (cl-raft:raft-leader-p w)))
       (is (<= led 7) "its election timeout")
       (is (null (gethash "z" (rsim-kv sim "b")))))))
+
+(test a-witness-brings-a-voter-far-behind-level-within-its-one-election-timeout
+  ;; The witness leads for one election timeout (seven ticks here). Backing up one
+  ;; entry per round would not cover forty entries; the voter says where its log ends.
+  (let ((sim (witness-sim)))
+    (setf (rsim-groups sim) '(("a" "w") ("b")))
+    (dotimes (i 40)
+      (cl-raft:raft-propose (rsim-node sim "a") (list :set "x" i)))
+    (rsim-run sim 2)
+    (is (>= (- (cl-raft::raft-last-log-index (rsim-node sim "w"))
+               (cl-raft::raft-last-log-index (rsim-node sim "b")))
+            40))
+    (setf (rsim-groups sim) '(("b" "w") ("a")))
+    (rsim-run sim 30)
+    (is (cl-raft:raft-leader-p (rsim-node sim "b")))
+    (is (eql 39 (gethash "x" (rsim-kv sim "b"))))))
