@@ -38,6 +38,15 @@
 
 (defun rsim-run (sim ticks) (dotimes (i ticks) (rsim-tick sim)))
 
+(defun rsim-tick-one-at-a-time (sim stop-node)
+  "One tick, delivering messages singly and stopping the moment STOP-NODE leads,
+   so a test can act while a witness holds its brief leadership."
+  (dolist (entry (rsim-nodes sim)) (cl-raft:raft-tick (cdr entry)))
+  (loop while (and (rsim-queue sim) (not (cl-raft:raft-leader-p stop-node)))
+        do (destructuring-bind (to . msg) (pop (rsim-queue sim))
+             (when (rsim-deliverable sim (getf msg :from) to)
+               (cl-raft:raft-handle-message (rsim-node sim to) msg)))))
+
 (defun make-rsim (ids timeouts
                   &key (state-factory (lambda () (make-hash-table :test 'equal)))
                        (apply-maker (lambda (state) (lambda (command) (raft-kv-apply state command)))))
@@ -233,3 +242,111 @@
       (is (null (first-refused node 100)))
       (is (null (first-refused node 4000)))
       (is (eql 1 (first-refused node 5000)) "the budget still binds, at the entry's own size"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Two voters and a witness: the witness stands in when it is what keeps the
+;;; surviving voter from winning.
+
+(defun witness-sim ()
+  "Voters a and b with witness w. a has the shortest timeout and leads first."
+  (let ((sim (make-rsim '("a" "b" "w") '(("a" . 3) ("b" . 5) ("w" . 7)))))
+    (dolist (id '("a" "b" "w"))
+      (cl-raft:raft-configure (rsim-node sim id) '(("a" . :voter) ("b" . :voter) ("w" . :witness))))
+    (rsim-run sim 8)
+    sim))
+
+(defun witness-sim-with-b-behind ()
+  "The witness-sim after a has committed x=1 with w alone: b never received it."
+  (let ((sim (witness-sim)) (acknowledged nil))
+    (setf (rsim-groups sim) '(("a" "w") ("b")))
+    (cl-raft:raft-propose (rsim-node sim "a") '(:set "x" 1) (lambda (r) (setf acknowledged r)))
+    (rsim-run sim 2)
+    (values sim acknowledged)))
+
+(test a-witness-ahead-of-the-surviving-voter-hands-it-the-log
+  ;; The leader and the witness are a majority, so a write they alone hold is
+  ;; committed and acknowledged. When that leader fails, the other voter is behind
+  ;; the witness; the witness must refuse it, and used to leave the cluster with
+  ;; no leader until the failed one came back.
+  (multiple-value-bind (sim acknowledged) (witness-sim-with-b-behind)
+    (is (eql 1 acknowledged) "the client was told its write is saved")
+    (is (null (gethash "x" (rsim-kv sim "b"))) "b does not have it")
+    (is (> (cl-raft::raft-last-log-index (rsim-node sim "w"))
+           (cl-raft::raft-last-log-index (rsim-node sim "b"))))
+    (setf (rsim-groups sim) '(("b" "w") ("a")))        ; the leader fails
+    (rsim-run sim 30)
+    (is (cl-raft:raft-leader-p (rsim-node sim "b")) "the surviving voter leads")
+    (is (not (cl-raft:raft-leader-p (rsim-node sim "w"))))
+    (is (eql 1 (gethash "x" (rsim-kv sim "b"))) "and holds the acknowledged write")
+    (let ((saved nil))
+      (cl-raft:raft-propose (rsim-node sim "b") '(:set "y" 2) (lambda (r) (setf saved r)))
+      (rsim-run sim 4)
+      (is (eql 2 saved) "and accepts new writes"))
+    (setf (rsim-groups sim) nil)                       ; the old leader returns
+    (rsim-run sim 10)
+    (is (equal '("b") (rsim-leaders sim)))
+    (is (eql 2 (gethash "y" (rsim-kv sim "a"))))))
+
+(test a-witness-level-with-the-surviving-voter-just-votes
+  (let ((sim (witness-sim)))
+    (cl-raft:raft-propose (rsim-node sim "a") '(:set "x" 1))
+    (rsim-run sim 4)
+    (let ((witness-term nil))
+      (setf (rsim-groups sim) '(("b" "w") ("a")))
+      ;; b times out, asks, and wins on the witness's vote: the witness never leads.
+      (dotimes (i 30)
+        (rsim-tick sim)
+        (when (cl-raft:raft-leader-p (rsim-node sim "w")) (setf witness-term t)))
+      (is (null witness-term))
+      (is (cl-raft:raft-leader-p (rsim-node sim "b"))))))
+
+(test a-witness-does-not-stand-in-while-it-hears-a-leader
+  ;; b is cut off from the leader and behind; the witness still follows a.
+  (multiple-value-bind (sim acknowledged) (witness-sim-with-b-behind)
+    (declare (ignore acknowledged))
+    (let ((term (cl-raft:raft-node-current-term (rsim-node sim "a"))))
+      (setf (rsim-groups sim) '(("a" "w") ("b" "w")))
+      (rsim-run sim 40)
+      (is (equal '("a") (rsim-leaders sim)))
+      (is (= term (cl-raft:raft-node-current-term (rsim-node sim "a"))) "no election disturbed it"))))
+
+(test a-witness-stands-in-only-for-a-voter-it-can-serve
+  (multiple-value-bind (sim acknowledged) (witness-sim-with-b-behind)
+    (declare (ignore acknowledged))
+    (let* ((w (rsim-node sim "w"))
+           (ask (lambda (&rest overrides)
+                  (cl-raft::raft-witness-should-stand-in-p
+                   w (append overrides
+                             (list :type :pre-vote :from "b"
+                                   :term (1+ (cl-raft:raft-node-current-term w))
+                                   :last-log-index (cl-raft::raft-last-log-index (rsim-node sim "b"))
+                                   :last-log-term (cl-raft::raft-last-log-term (rsim-node sim "b"))))))))
+      (is (not (funcall ask)) "it still hears the leader")
+      (setf (cl-raft::raft-node-leader-contact-elapsed w) 1000)
+      (is (funcall ask))
+      (is (not (funcall ask :term (cl-raft:raft-node-current-term w))) "a stale round")
+      (is (not (funcall ask :from "stranger")))
+      (is (not (funcall ask :last-log-index (1- (cl-raft::raft-node-snapshot-index w))))
+          "the voter needs entries the witness no longer has")
+      (setf (cl-raft::raft-node-snapshot-index w) (cl-raft::raft-last-log-index w))
+      (is (not (funcall ask)) "after discarding them it cannot help")
+      (is (not (cl-raft::raft-witness-should-stand-in-p
+                (rsim-node sim "b") (list :type :pre-vote :from "a" :term 99 :last-log-index 0 :last-log-term 0)))
+          "a voter never stands in"))))
+
+(test a-witness-that-leads-takes-no-proposal-and-gives-up-within-an-election-timeout
+  (multiple-value-bind (sim acknowledged) (witness-sim-with-b-behind)
+    (declare (ignore acknowledged))
+    (let ((w (rsim-node sim "w")) (led 0))
+      (setf (rsim-groups sim) '(("b" "w") ("a")))
+      ;; Run until the witness wins, then cut it off from the voter it would serve.
+      (loop repeat 30 until (cl-raft:raft-leader-p w) do (rsim-tick-one-at-a-time sim w))
+      (is (cl-raft:raft-leader-p w))
+      (setf (rsim-groups sim) '(("a") ("b") ("w")))
+      (is (equal '(nil nil :transferring)
+                 (multiple-value-list (cl-raft:raft-propose w '(:set "z" 9)))))
+      (is (equal '(nil :not-leader) (multiple-value-list (cl-raft:raft-read-index w #'identity))))
+      (loop while (cl-raft:raft-leader-p w) repeat 20 do (rsim-tick sim) (incf led))
+      (is (not (cl-raft:raft-leader-p w)))
+      (is (<= led 7) "its election timeout")
+      (is (null (gethash "z" (rsim-kv sim "b")))))))

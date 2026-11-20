@@ -522,15 +522,17 @@ an atomic replacement, including its log-tail policy, before calling this helper
   (dolist (peer (raft-node-peers node))
     (raft-send node peer (funcall message-fn peer))))
 
-(defun raft-begin-pre-election (node)
+(defun raft-begin-pre-election (node &optional standing-in)
   "Pre-Vote (Raft dissertation §9.6): without touching term, role, or vote, ask
    peers whether this node could win at the next term. Reset the election timer,
    grant self, and -- unless a one-node quorum already suffices -- broadcast a
    :pre-vote for term (1+ current). Only a quorum of grants promotes to a real
    candidate; short of that the term is never bumped, so a member that cannot win
    (it is behind, or a healthy leader still rules) cannot depose the leader
-   (podster-8r7)."
-  (when (eq (raft-node-self-role node) :voter)
+   (podster-8r7). Only a voter campaigns on its own timer; STANDING-IN lets a
+   witness campaign once, to hand over its log (see RAFT-WITNESS-SHOULD-STAND-IN-P)."
+  (when (or (eq (raft-node-self-role node) :voter)
+            (and standing-in (eq (raft-node-self-role node) :witness)))
     (setf (raft-node-pre-vote-term node) (1+ (raft-node-current-term node)))
     (clrhash (raft-node-pre-votes node))
     (setf (gethash (raft-node-id node) (raft-node-pre-votes node)) t)
@@ -644,7 +646,8 @@ RPC can widen the same string. This is distinct from printed-wire expansion."
 (defun raft-append-message (node peer)
   "Build a bounded AppendEntries batch beginning at PEER's next-index.
 Retries never encode the entire retained suffix. One oversized command travels
-alone so existing persisted commands remain deliverable."
+alone so existing persisted commands remain deliverable. Returns NIL when this
+node is a witness and PEER needs a snapshot, which a witness cannot provide."
   (let* ((next (gethash peer (raft-node-next-index node) (1+ (raft-last-log-index node))))
          (cached (when (and (raft-node-catchup-byte-limit node)
                             (not (gethash peer (raft-node-peer-snapshot-required node)))
@@ -666,6 +669,11 @@ alone so existing persisted commands remain deliverable."
                             (or (zerop count) (<= (+ bytes weight) (raft-node-append-byte-budget node))))
                  do (incf bytes weight)
                  collect entry)))
+    (when (and (<= next (raft-node-snapshot-index node))
+               (eq :witness (raft-node-self-role node)))
+      ;; A witness holds a log and no application state. A peer that needs
+      ;; entries it has already discarded can only be helped by a voter.
+      (return-from raft-append-message nil))
     (when (<= next (raft-node-snapshot-index node))
       (unless (raft-snapshot-envelope-p (raft-node-snapshot-state node))
         (error "Snapshot lacks configuration; create a fresh configured snapshot before transfer"))
@@ -690,7 +698,8 @@ alone so existing persisted commands remain deliverable."
    once its match-index shows it has stored its own removal entry."
   (setf (raft-node-heartbeat-elapsed node) 0)
   (dolist (peer (raft-replicate-ids node))
-    (raft-send node peer (raft-append-message node peer)))
+    (let ((message (raft-append-message node peer)))
+      (when message (raft-send node peer message))))
   ;; A departing member that already holds its removal entry has now also been
   ;; sent the commit for it (this append carries leader-commit), so it will apply
   ;; the change and learn it is out. Stop tracking it. If it has not yet stored
@@ -804,7 +813,10 @@ alone so existing persisted commands remain deliverable."
   (cond
     ((or (not (eq (raft-node-role node) :leader)) (raft-node-snapshot-pending node))
      (values nil nil :not-leader))
-    ((raft-node-lead-transferee node) (values nil nil :transferring))
+    ;; A witness leads only to hand its log to a voter; it has no state machine
+    ;; to apply a command to, so a client must wait for that voter.
+    ((or (raft-node-lead-transferee node) (eq :witness (raft-node-self-role node)))
+     (values nil nil :transferring))
     (t
      (let ((reason (raft-proposals-capacity-reason node commands)))
        (when reason (return-from raft-propose-batch (values nil nil reason))))
@@ -837,7 +849,8 @@ alone so existing persisted commands remain deliverable."
    (values nil reason) without calling CALLBACK: :not-leader, or :not-ready if
    this leader has not yet committed its election barrier (retry shortly)."
   (cond
-    ((or (not (eq (raft-node-role node) :leader)) (raft-node-snapshot-pending node))
+    ((or (not (eq (raft-node-role node) :leader)) (raft-node-snapshot-pending node)
+         (eq :witness (raft-node-self-role node)))   ; a witness has nothing to read
      (values nil :not-leader))
     ((/= (raft-log-term node (raft-node-commit-index node)) (raft-node-current-term node))
      (values nil :not-ready))
@@ -889,8 +902,19 @@ alone so existing persisted commands remain deliverable."
      (setf (raft-node-lead-transferee node) target)
      (raft-maybe-send-timeout-now node)
      (unless (raft-node-transfer-sent node)
-       (raft-send node target (raft-append-message node target)))
+       (let ((message (raft-append-message node target)))
+         (when message (raft-send node target message))))
      t)))
+
+(defun raft-witness-choose-successor (node peer)
+  "A witness leading in a voter's place hands over to the first voter that holds
+   its whole log. PEER has just acknowledged entries."
+  (when (and (eq :witness (raft-node-self-role node))
+             (null (raft-node-lead-transferee node))
+             (member peer (raft-node-peers node) :test #'equal)
+             (eq :voter (raft-member-role node peer))
+             (= (gethash peer (raft-node-match-index node) 0) (raft-last-log-index node)))
+    (setf (raft-node-lead-transferee node) peer)))
 
 (defun raft-maybe-send-timeout-now (node)
   (let ((target (raft-node-lead-transferee node)))
@@ -1100,7 +1124,39 @@ following leadership changes; old peers without applied receipts cannot qualify.
                      up-to-date)))
     (raft-send node (getf msg :from)
                (list :type :pre-vote-reply :term (raft-node-current-term node)
-                     :pre-term (getf msg :term) :from (raft-node-id node) :granted grant))))
+                     :pre-term (getf msg :term) :from (raft-node-id node) :granted grant))
+    (when (and (not grant) (raft-witness-should-stand-in-p node msg))
+      (raft-begin-pre-election node t))))
+
+(defun raft-witness-should-stand-in-p (node msg)
+  "True when this witness has just refused the Pre-Vote MSG for one reason only:
+   the candidate's log is behind its own.
+
+   A witness acknowledges an entry as soon as it is stored; a voter also has to
+   apply what it stores. So when a leader fails under load, the surviving voter is
+   often an entry or two behind the witness. The witness is right to refuse it --
+   the leader and the witness were a majority, so those entries may be committed
+   and acknowledged to a client -- but a witness never campaigns, so no member
+   could win and the cluster waited for the failed leader to return.
+
+   The witness holds the entries the voter lacks. It therefore stands for election
+   itself, which it can win because its log is the most up to date, replicates its
+   log to the voter as any leader does, and transfers leadership to that voter as
+   soon as the voter holds all of it (RAFT-WITNESS-CHOOSE-SUCCESSOR). It accepts no
+   proposal meanwhile. Nothing here is outside ordinary Raft: any member whose log
+   is up to date may lead, and a leader may hand over.
+
+   It stands only if it can serve the candidate from its own log; a candidate that
+   needs entries the witness has discarded must get a snapshot from a voter."
+  (and (eq :witness (raft-node-self-role node))
+       (not (raft-node-removed node))
+       (not (eq (raft-node-role node) :leader))
+       (>= (raft-node-leader-contact-elapsed node) (raft-node-election-timeout node))
+       (> (getf msg :term) (raft-node-current-term node))
+       (eq :voter (raft-member-role node (getf msg :from)))
+       (member (getf msg :from) (raft-node-peers node) :test #'equal)
+       (typep (getf msg :last-log-index) 'fixnum)
+       (>= (getf msg :last-log-index) (raft-node-snapshot-index node))))
 
 (defun raft-handle-pre-vote-reply (node msg)
   "Count a Pre-Vote grant for the round in flight; on a quorum, become a real
@@ -1269,6 +1325,7 @@ free a prefix the leader has already moved past."
               (raft-advance-commit node)
               (raft-apply-committed node)
               (when (eq (raft-node-role node) :leader)
+                (raft-witness-choose-successor node peer)
                 (raft-maybe-send-timeout-now node)))
             ;; Back up and retry on the next replication round.
             (let ((required (raft-peer-recovery-index node peer)))
@@ -1378,8 +1435,10 @@ free a prefix the leader has already moved past."
 
 (defun raft-tick (node)
   "Advance one logical tick: voter candidates/followers may start an election,
-   leaders send heartbeats. A witness or learner never starts an election (so it
-   never becomes leader); a removed member does nothing."
+   leaders send heartbeats. A learner never starts an election, and a witness
+   never starts one on its own timer: it stands only when it is what keeps a voter
+   from winning (RAFT-WITNESS-SHOULD-STAND-IN-P), and then leads for at most one
+   election timeout. A removed member does nothing."
   (unless (or (raft-node-removed node) (raft-node-snapshot-pending node))
     (case (raft-node-role node)
       ((:follower :candidate)
@@ -1392,9 +1451,13 @@ free a prefix the leader has already moved past."
          (raft-broadcast-append node))
        ;; A transfer that has not completed within an election timeout failed
        ;; (target crashed, partitioned, or lost the election): resume service.
-       (when (and (raft-node-lead-transferee node)
+       (when (and (or (raft-node-lead-transferee node) (eq :witness (raft-node-self-role node)))
                   (>= (incf (raft-node-transfer-elapsed node)) (raft-node-election-timeout node)))
-         (raft-clear-transfer node))
+         (if (eq :witness (raft-node-self-role node))
+             ;; No voter took over in time. Leading on would help nobody: stand
+             ;; down, and stand in again when a voter next asks for a vote.
+             (return-from raft-tick (raft-become-follower node (raft-node-current-term node)))
+             (raft-clear-transfer node)))
        (when (and (raft-node-check-quorum node)
                   (>= (incf (raft-node-check-quorum-elapsed node)) (raft-node-election-timeout node)))
          (raft-check-quorum node))))))

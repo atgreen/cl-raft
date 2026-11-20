@@ -89,11 +89,27 @@ a node *is allowed to do* in the cluster. This is the "learning mode" axis.
 | Membership role | Counts toward quorum? | Can it start an election / lead? | Gets the log? |
 |-----------------|:---:|:---:|:---:|
 | `:voter`   | yes | yes | yes |
-| `:witness` | yes | **no** | yes |
+| `:witness` | yes | **only to hand over** (below) | yes |
 | `:learner` | **no** | **no** | yes |
 
-A **witness** votes and counts for quorum but never campaigns — useful as a
-tie-breaking member that you don't want to ever become leader. A **learner** is
+A **witness** votes and counts for quorum, and holds the log but no application
+state — a tie-breaking member that can run on a very small machine. It never
+campaigns on its own timer and never accepts a proposal.
+
+There is one case where it must lead briefly. A witness acknowledges an entry as
+soon as it is stored; a voter also has to apply it. So when a leader fails under
+load, the surviving voter is often an entry or two behind the witness. Those
+entries may be committed (leader + witness is a majority), so the witness is
+right to refuse that voter its vote — and then nobody can win. When a witness
+refuses a Pre-Vote *only* because the candidate is behind it, and it has heard
+no leader for an election timeout, it stands for election itself
+(`raft-witness-should-stand-in-p`), replicates its log to the voter as any
+leader would, and transfers leadership to the first voter that holds all of it
+(`raft-witness-choose-successor`). If no voter takes over within one election
+timeout it steps down. It does not stand if the voter needs entries the witness
+has already discarded: only a snapshot from another voter can help then.
+
+A **learner** is
 the subject of the next section.
 
 ## A4. Learning mode: learners and promotion
